@@ -245,6 +245,12 @@ Teléfono: {phone}"""
         }
     }
 
+    # Validar que la API key esté configurada
+    if not GEMINI_API_KEY:
+        print("[ERROR] GEMINI_API_KEY no está configurada en las variables de entorno de Vercel.")
+        return "Lo siento, el servicio no está configurado correctamente."
+
+    r = None
     try:
         r = httpx.post(
             GEMINI_URL,
@@ -253,9 +259,18 @@ Teléfono: {phone}"""
             timeout=30
         )
         result = r.json()
+
+        # Detectar error explícito de la API de Gemini
+        if "error" in result:
+            err = result["error"]
+            print(f"[GEMINI ERROR] code={err.get('code')} status={err.get('status')} message={err.get('message')}")
+            return "Lo siento, tuve un problema técnico. Intenta de nuevo en un momento."
+
         return result["candidates"][0]["content"]["parts"][0]["text"]
+
     except Exception as e:
-        print(f"Error llamando a Gemini: {e} — Respuesta: {r.text if 'r' in dir() else ''}")
+        raw = r.text if r is not None else "(sin respuesta)"
+        print(f"[GEMINI EXCEPTION] {e} — Respuesta raw: {raw}")
         return "Lo siento, tuve un problema técnico. Intenta de nuevo en un momento."
 
 
