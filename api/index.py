@@ -20,7 +20,7 @@ VERIFY_TOKEN   = os.environ.get("VERIFY_TOKEN", "whatsapp_verify_2026")
 META_TOKEN     = os.environ.get("META_TOKEN", "")        # El valor real va en Vercel > Settings > Env Variables
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")   # El valor real va en Vercel > Settings > Env Variables
 
-GEMINI_MODEL = "gemini-2.5-flash-preview-05-20"
+GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_URL   = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 # ──────────────────────────────────────────
