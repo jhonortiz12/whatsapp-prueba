@@ -1,32 +1,27 @@
 """
 Tienda de Ropa — WhatsApp Bot
-WhatsApp (Meta) + Grok (xAI)
+WhatsApp (Meta) + Gemini 2.5 Flash (Google AI)
 Deploy en Vercel — Sin Shopify, catálogo local
 """
 
 import json
 import os
 import re
+import base64
 import datetime
 import httpx
-from openai import OpenAI
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 # ──────────────────────────────────────────
 # CONFIGURACIÓN
 # ──────────────────────────────────────────
-VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "whatsapp_verify_2026")
-META_TOKEN   = os.environ.get("META_TOKEN", "")      # El valor real va en Vercel > Settings > Env Variables
-XAI_API_KEY  = os.environ.get("XAI_API_KEY", "")    # El valor real va en Vercel > Settings > Env Variables
+VERIFY_TOKEN   = os.environ.get("VERIFY_TOKEN", "whatsapp_verify_2026")
+META_TOKEN     = os.environ.get("META_TOKEN", "")        # El valor real va en Vercel > Settings > Env Variables
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")   # El valor real va en Vercel > Settings > Env Variables
 
-GROK_MODEL = "grok-3"
-
-# Cliente xAI (compatible con OpenAI SDK)
-grok_client = OpenAI(
-    api_key=XAI_API_KEY,
-    base_url="https://api.x.ai/v1",
-)
+GEMINI_MODEL = "gemini-2.5-flash-preview-05-20"
+GEMINI_URL   = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 # ──────────────────────────────────────────
 # CATÁLOGO LOCAL DE PRODUCTOS
@@ -146,6 +141,27 @@ orders: list = []          # Órdenes simuladas (sin Shopify)
 
 
 # ──────────────────────────────────────────
+# META — descargar imagen
+# ──────────────────────────────────────────
+def download_image(media_id: str) -> tuple:
+    """Descarga una imagen de WhatsApp y retorna (bytes, mime_type)."""
+    headers = {"Authorization": f"Bearer {META_TOKEN}"}
+    try:
+        r = httpx.get(
+            f"https://graph.facebook.com/v19.0/{media_id}",
+            headers=headers, timeout=10
+        )
+        data = r.json()
+        media_url = data.get("url", "")
+        mime_type = data.get("mime_type", "image/jpeg")
+        r2 = httpx.get(media_url, headers=headers, timeout=15)
+        return r2.content, mime_type
+    except Exception as e:
+        print(f"Error descargando imagen: {e}")
+        return None, None
+
+
+# ──────────────────────────────────────────
 # META — enviar mensaje de texto
 # ──────────────────────────────────────────
 def send_whatsapp_message(phone_number_id: str, to: str, text: str):
@@ -165,9 +181,16 @@ def send_whatsapp_message(phone_number_id: str, to: str, text: str):
 
 
 # ──────────────────────────────────────────
-# GROK — llamar a la API (xAI)
+# GEMINI 2.5 FLASH — llamar a la API
 # ──────────────────────────────────────────
-def call_grok(history: list, user_name: str, phone: str) -> str:
+def call_gemini(
+    history: list,
+    user_name: str,
+    phone: str,
+    image_bytes: bytes = None,
+    mime_type: str = None,
+    caption: str = ""
+) -> str:
     system_prompt = f"""Eres un asistente de ventas de una tienda de ropa por WhatsApp. Tu nombre es Moda Assistant.
 
 Tu trabajo es ayudar a los clientes a encontrar prendas, informar sobre tallas, colores, precios y disponibilidad, y guiarlos para concretar una compra.
@@ -178,38 +201,77 @@ CATÁLOGO ACTUAL DE PRODUCTOS:
 REGLAS:
 1. Responde siempre en español, de forma amable y natural (sin markdown, sin asteriscos).
 2. Si el cliente pregunta por un producto, busca en el catálogo y da la info de tallas, colores y precio.
-3. Si una talla o color no está disponible, díselo y ofrece alternativas del catálogo.
-4. Si el cliente quiere comprar, pídele en orden: nombre completo, dirección de envío, confirma producto/talla/color.
-5. Cuando tengas TODOS los datos, incluye al final de tu mensaje exactamente esto (sin espacios extra):
+3. Si el cliente manda una imagen, analiza qué prenda es y busca la más similar en el catálogo.
+4. Si una talla o color no está disponible, díselo y ofrece alternativas del catálogo.
+5. Si el cliente quiere comprar, pídele en orden: nombre completo, dirección de envío, confirma producto/talla/color.
+6. Cuando tengas TODOS los datos, incluye al final de tu mensaje exactamente esto (sin espacios extra):
 DATO_VENTA_JSON:{{"accion":"crear_orden","cliente":{{"nombre":"NOMBRE","telefono":"TELEFONO","direccion":"DIRECCION"}},"producto":{{"titulo":"TITULO","talla":"TALLA","color":"COLOR","precio":"PRECIO","cantidad":1}}}}
-6. Sé breve y conversacional. Máximo 3-4 líneas por respuesta.
-7. Si preguntan algo fuera de la tienda, redirige amablemente.
+7. Sé breve y conversacional. Máximo 3-4 líneas por respuesta.
+8. Si preguntan algo fuera de la tienda, redirige amablemente.
 
 Nombre del cliente: {user_name}
 Teléfono: {phone}"""
 
+    # Construir el array de contents para Gemini
+    contents = []
+    for msg in history:
+        role = msg["role"]  # "user" o "model"
+        contents.append({
+            "role": role,
+            "parts": [{"text": msg["content"]}]
+        })
+
+    # Si el mensaje actual tiene imagen, reemplazar las parts del último mensaje
+    if image_bytes and contents and contents[-1]["role"] == "user":
+        contents[-1]["parts"] = [
+            {
+                "inline_data": {
+                    "mime_type": mime_type or "image/jpeg",
+                    "data": base64.b64encode(image_bytes).decode("utf-8")
+                }
+            },
+            {
+                "text": caption if caption else "El cliente envió esta imagen. ¿Tienes algo parecido en el catálogo?"
+            }
+        ]
+
+    payload = {
+        "system_instruction": {
+            "parts": [{"text": system_prompt}]
+        },
+        "contents": contents,
+        "generationConfig": {
+            "maxOutputTokens": 1024,
+            "temperature": 0.7
+        }
+    }
+
     # Validar que la API key esté configurada
-    if not XAI_API_KEY:
-        print("[ERROR] XAI_API_KEY no está configurada en las variables de entorno de Vercel.")
+    if not GEMINI_API_KEY:
+        print("[ERROR] GEMINI_API_KEY no está configurada en las variables de entorno de Vercel.")
         return "Lo siento, el servicio no está configurado correctamente."
 
-    # Construir mensajes en formato OpenAI
-    messages = [{"role": "system", "content": system_prompt}]
-    for msg in history:
-        role = "assistant" if msg["role"] == "model" else msg["role"]
-        messages.append({"role": role, "content": msg["content"]})
-
+    r = None
     try:
-        response = grok_client.chat.completions.create(
-            model=GROK_MODEL,
-            messages=messages,
-            max_tokens=1024,
-            temperature=0.7,
+        r = httpx.post(
+            GEMINI_URL,
+            params={"key": GEMINI_API_KEY},
+            json=payload,
+            timeout=30
         )
-        return response.choices[0].message.content
+        result = r.json()
+
+        # Detectar error explícito de la API de Gemini
+        if "error" in result:
+            err = result["error"]
+            print(f"[GEMINI ERROR] code={err.get('code')} status={err.get('status')} message={err.get('message')}")
+            return "Lo siento, tuve un problema técnico. Intenta de nuevo en un momento."
+
+        return result["candidates"][0]["content"]["parts"][0]["text"]
 
     except Exception as e:
-        print(f"[GROK EXCEPTION] {e}")
+        raw = r.text if r is not None else "(sin respuesta)"
+        print(f"[GEMINI EXCEPTION] {e} — Respuesta raw: {raw}")
         return "Lo siento, tuve un problema técnico. Intenta de nuevo en un momento."
 
 
@@ -247,6 +309,10 @@ def process_message(body: dict):
 
         history = conversations.get(phone, [])
 
+        image_bytes = None
+        mime_type_img = None
+        caption = ""
+
         # ── Mensaje de TEXTO ──
         if msg_type == "text":
             user_text = msg["text"]["body"]
@@ -254,7 +320,10 @@ def process_message(body: dict):
 
         # ── Mensaje de IMAGEN ──
         elif msg_type == "image":
+            media_id = msg["image"]["id"]
             caption = msg["image"].get("caption", "")
+            image_bytes, mime_type_img = download_image(media_id)
+            # En el historial guardamos descripción textual (no los bytes)
             history.append({
                 "role": "user",
                 "content": caption if caption else "El cliente envió una imagen de una prenda."
@@ -264,22 +333,27 @@ def process_message(body: dict):
             # Audio, video, sticker — ignorar
             return
 
-        # ── Llamar a Grok ──
-        grok_response = call_grok(history, user_name, phone)
+        # ── Llamar a Gemini 2.5 Flash ──
+        gemini_response = call_gemini(
+            history, user_name, phone,
+            image_bytes=image_bytes,
+            mime_type=mime_type_img,
+            caption=caption
+        )
 
         # ── Detectar si hay datos de venta ──
-        venta_match = re.search(r'DATO_VENTA_JSON:(\{.+?\})(?:\n|$)', grok_response)
+        venta_match = re.search(r'DATO_VENTA_JSON:(\{.+?\})(?:\n|$)', gemini_response)
         venta_data = None
-        mensaje_limpio = grok_response
+        mensaje_limpio = gemini_response
 
         if venta_match:
             try:
                 venta_data = json.loads(venta_match.group(1))
-                mensaje_limpio = re.sub(r'DATO_VENTA_JSON:\{.+?\}(?:\n|$)', '', grok_response).strip()
+                mensaje_limpio = re.sub(r'DATO_VENTA_JSON:\{.+?\}(?:\n|$)', '', gemini_response).strip()
             except Exception:
                 pass
 
-        # ── Guardar respuesta en historial (rol "model" para compatibilidad) ──
+        # ── Guardar respuesta en historial (rol "model" para Gemini) ──
         history.append({"role": "model", "content": mensaje_limpio})
         conversations[phone] = history[-20:]  # Últimos 20 mensajes
 
